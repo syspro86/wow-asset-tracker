@@ -4,15 +4,28 @@ TradeSkillMaster Addon 설정 파일에서 WOW 자산 정보를 추출하여 일
 
 목표:
   1. 일별 총 골드 정보를 캐릭터별/warbank별로 구분하여 저장한다.
+     - 골드 미만 실버/코퍼 정보는 저장하지 않는다.
      - 접속 기록이 없는 날은 직전 보유량을 이월(forward-fill)한다.
      - 저장 경로: $OUTPUT_PATH/gold/YYYY/MM/DD.json
+     - 캐릭터 목록은 "캐릭명-서버명" 형태로 기록한다.
   2. 전문기술 주문제작 내역을 추출하여 저장한다.
      - 날짜별: $OUTPUT_PATH/crafting/YYYY/MM/DD.json (주문제작 기록 일자 기준)
      - 요청자별: $OUTPUT_PATH/crafting/서버명/캐릭명.json
+     - 수수료는 골드 단위로 소수점 4자리까지 기록한다.
+     - 요청자 서버 정보가 없으면 제작자 서버와 동일하게 처리한다.
+  3. 유형별 수입/지출 내역을 저장한다.
+     - 저장 경로: $OUTPUT_PATH/transactions/YYYY/MM/DD.json
+  4. 일별 골드 보유량 + 수입/지출 정보를 통해 누적형 영역 차트를 생성한다.
+     - X축 일자별, Y축 골드량 기준.
+     - 저장 경로: $OUTPUT_PATH/transactions.png
 
 입력:
-  --lua-path  또는  .env 의 LUA_PATH   : TradeSkillMaster.lua 파일 경로
-  --output-path  또는  .env 의 OUTPUT_PATH : 출력 디렉토리 경로 (기본값: ./output)
+  --lua-path    또는 .env 의 LUA_PATH    : TradeSkillMaster.lua 파일 경로
+  --output-path 또는 .env 의 OUTPUT_PATH : 출력 디렉토리 경로 (기본값: ./output)
+
+실행 방법:
+  python wow_asset_tracker.py
+  python wow_asset_tracker.py --lua-path "/path/to/TradeSkillMaster.lua" --output-path "./output"
 """
 
 import re
@@ -21,6 +34,13 @@ import argparse
 import os
 from datetime import date, datetime, timezone
 from dotenv import load_dotenv
+import matplotlib
+matplotlib.use("Agg")  # GUI 없는 환경(서버/스크립트)에서 파일로 저장
+from matplotlib import pyplot as plt
+from matplotlib.ticker import FuncFormatter
+from matplotlib import dates as mdates
+from matplotlib import font_manager as fm
+import numpy as np
 
 load_dotenv()  # .env 파일 로드
 
@@ -67,23 +87,21 @@ def copper_to_gold(copper: int) -> float:
 
 def extract_assets(raw: dict) -> dict:
     """
-    파싱된 Lua 딕셔너리에서 자산 정보를 추출합니다.
+    파싱된 Lua 딕셔너리에서 현재 자산 정보를 추출합니다.
+    골드 미만 실버/코퍼 정보는 포함하지 않습니다.
 
     반환 구조:
     {
         "extracted_at": "ISO-8601 timestamp",
         "characters": {
             "<name> - <faction> - <realm>": {
-                "money_copper": int,
                 "money_gold": float
             },
             ...
         },
         "warbank": {
-            "money_copper": int,
             "money_gold": float
         },
-        "total_copper": int,
         "total_gold": float
     }
     """
@@ -91,7 +109,6 @@ def extract_assets(raw: dict) -> dict:
         "extracted_at": datetime.now(timezone.utc).isoformat(),
         "characters": {},
         "warbank": {},
-        "total_copper": 0,
         "total_gold": 0.0,
     }
 
@@ -100,28 +117,25 @@ def extract_assets(raw: dict) -> dict:
         r"^s@(.+?)@internalData@money$"
     )
 
+    total_copper = 0
     for key, value in raw.items():
         m = char_money_pattern.match(key)
         if m and isinstance(value, int):
             char_name = m.group(1)
             assets["characters"][char_name] = {
-                "money_copper": value,
                 "money_gold": round(copper_to_gold(value), 4),
             }
+            total_copper += value
 
     # 전쟁금고 (Warbank): 키 형식 → g@ @internalData@warbankMoney
     warbank_key = "g@ @internalData@warbankMoney"
     if warbank_key in raw and isinstance(raw[warbank_key], int):
         wb_copper = raw[warbank_key]
         assets["warbank"] = {
-            "money_copper": wb_copper,
             "money_gold": round(copper_to_gold(wb_copper), 4),
         }
+        total_copper += wb_copper
 
-    # 총합 계산
-    total_copper = sum(c["money_copper"] for c in assets["characters"].values())
-    total_copper += assets.get("warbank", {}).get("money_copper", 0)
-    assets["total_copper"] = total_copper
     assets["total_gold"] = round(copper_to_gold(total_copper), 4)
 
     return assets
@@ -133,9 +147,10 @@ def extract_assets(raw: dict) -> dict:
 
 def parse_gold_log(log_str: str) -> list[tuple[str, int]]:
     """
-    goldLog 문자열("minute,copper\n...")을 파싱하여 (date_str, copper) 리스트로 반환합니다.
-    minute = Unix 타임스탬프 // 60
-    date_str = 'YYYY-MM-DD' (UTC)
+    goldLog 문자열("minute,copper\n...")을 파싱하여 (date_str, copper_amount) 리스트로 반환합니다.
+    - minute: Unix 타임스탬프 // 60
+    - copper_amount: copper 단위 보유량 (골드 변환 시 10000으로 나눔)
+    - date_str: 'YYYY-MM-DD' (UTC 기준)
     """
     # Lua 파일에서 개행 문자가 리터럴 \n 으로 저장되어 있으므로 변환
     log_str = log_str.replace("\\n", "\n")
@@ -166,16 +181,18 @@ def extract_daily_gold_history(raw: dict) -> dict:
 
     접속 기록이 없는 날은 가장 최근 기록값을 이월(forward-fill)하므로
     모든 날짜에서 전체 캐릭터 + 전쟁금고 합산이 정확하게 계산됩니다.
+    골드 미만 실버/코퍼 정보는 포함하지 않으며, 정수 골드 단위로만 저장합니다.
 
     반환 구조:
     {
         "YYYY-MM-DD": {
-            "characters_copper": int,
-            "characters_gold": float,
-            "warbank_copper": int,
-            "warbank_gold": float,
-            "total_copper": int,
-            "total_gold": float
+            "characters_gold": int,   # 캐릭터 합산 골드 (정수)
+            "warbank_gold": int,      # 전쟁금고 골드 (정수)
+            "total_gold": int,        # 전체 합산 골드 (정수)
+            "characters": {           # 캐릭터별 골드 ("캐릭명-서버명" 형태)
+                "캐릭명-서버명": int,
+                ...
+            }
         },
         ...
     }
@@ -247,7 +264,7 @@ def extract_daily_gold_history(raw: dict) -> dict:
         total_copper = char_copper + wb_copper
 
         # 캐릭터별 상세 (정수 골드만 저장, 실버/코퍼 미만 제외)
-        # 키: "CharName - Faction - ServerName" → "캐릭명-서버명"
+        # TSM 키: "CharName - Faction - ServerName" → "캐릭명-서버명" 형태로 변환
         def _char_key(tsm_key: str) -> str:
             parts = tsm_key.split(" - ")
             if len(parts) == 3:
@@ -260,13 +277,11 @@ def extract_daily_gold_history(raw: dict) -> dict:
             if k.startswith("char:")
         }
 
-
         history[date_str] = {
             "characters_gold": int(copper_to_gold(char_copper)),
             "warbank_gold": int(copper_to_gold(wb_copper)),
             "total_gold": int(copper_to_gold(total_copper)),
             "characters": characters,
-            "warbank": int(copper_to_gold(wb_copper)),
         }
 
     return history
@@ -320,10 +335,11 @@ def print_gold_history(history: dict, n: int = 10) -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 
 
-def parse_csv_income(csv_str: str) -> list[dict]:
+def parse_csv_records(csv_str: str) -> list[dict]:
     """
-    csvIncome 문자열을 파싱하여 Crafting Order 항목 리스트를 반환합니다.
+    csv(Income/Expense 등) 문자열에서 모든 항목을 파싱하여 리스트로 반환합니다.
     형식: type,amount,otherPlayer,player,time
+    - amount 양수: 수입 (income), 음수: 지출 (expense)
     """
     csv_str = csv_str.replace("\\n", "\n")
     lines = csv_str.strip().split("\n")
@@ -336,8 +352,6 @@ def parse_csv_income(csv_str: str) -> list[dict]:
         if len(parts) != 5:
             continue
         rec_type, amount_str, other_player, player, time_str = parts
-        if rec_type != "Crafting Order":
-            continue
         try:
             amount = int(amount_str)
             ts = int(time_str)
@@ -348,8 +362,9 @@ def parse_csv_income(csv_str: str) -> list[dict]:
             "date": dt.strftime("%Y-%m-%d"),
             "date_compact": dt.strftime("%Y%m%d"),
             "datetime": dt.isoformat(),
-            "requester": other_player,
-            "crafter": player,
+            "type": rec_type,
+            "other_player": other_player,
+            "player": player,
             "amount_copper": amount,
             "amount_gold": round(copper_to_gold(amount), 4),
         })
@@ -372,21 +387,122 @@ def extract_crafting_orders(raw: dict) -> list[dict]:
         if not isinstance(value, str):
             continue
         crafter_server = m.group(1).strip()
-        for rec in parse_csv_income(value):
-            uid = (rec["requester"], rec["crafter"], rec["datetime"])
+        for rec in parse_csv_records(value):
+            if rec["type"] != "Crafting Order":
+                continue
+            uid = (rec["other_player"], rec["player"], rec["datetime"])
             if uid in seen:
                 continue
             seen.add(uid)
             rec["crafter_server"] = crafter_server
+            # crafting 함수와의 호환을 위해 requester/crafter 필드 추가
+            rec["requester"] = rec["other_player"]
+            rec["crafter"] = rec["player"]
             records.append(rec)
 
     records.sort(key=lambda r: r["datetime"])
     return records
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# 수입/지출 이력 추출 (모든 유형: Crafting Order, Repair Bill 등)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def extract_transactions(raw: dict) -> dict:
+    """
+    모든 csvIncome 키에서 유형별 수입/지출을 수집하여 일별로 집계합니다.
+
+    반환 구조:
+    {
+        "YYYY-MM-DD": {
+            "income_gold": float,   # 수입 합계 (양수 amount)
+            "expense_gold": float,  # 지출 합계 (음수 amount 절댓값)
+            "net_gold": float,      # 순수입 (income - expense)
+            "by_type": {
+                "<type>": {
+                    "income_gold": float,
+                    "expense_gold": float,
+                    "count": int
+                },
+                ...
+            }
+        },
+        ...
+    }
+    """
+    # csvIncome(수입/일반) 및 csvExpense(지출/수리비 등) 패턴 모두 수집
+    pattern = re.compile(r"^r@(.+?)@internalData@(csvIncome|csvExpense)$")
+    seen = set()
+
+    # 일별 유형별 집계
+    daily: dict[str, dict] = {}
+
+    for key, value in raw.items():
+        m = pattern.match(key)
+        if not m:
+            continue
+        if not isinstance(value, str):
+            continue
+        
+        source_type = m.group(2)  # "csvIncome" or "csvExpense"
+        
+        for rec in parse_csv_records(value):
+            uid = (rec["date"], rec["type"], rec["other_player"], rec["player"], rec["datetime"])
+            if uid in seen:
+                continue
+            seen.add(uid)
+
+            d = rec["date"]
+            t = rec["type"]
+            gold = abs(rec["amount_gold"])
+
+            if d not in daily:
+                daily[d] = {"income_gold": 0.0, "expense_gold": 0.0, "by_type": {}}
+            if t not in daily[d]["by_type"]:
+                daily[d]["by_type"][t] = {"income_gold": 0.0, "expense_gold": 0.0, "count": 0}
+
+            if source_type == "csvIncome":
+                daily[d]["income_gold"] = round(daily[d]["income_gold"] + gold, 4)
+                daily[d]["by_type"][t]["income_gold"] = round(
+                    daily[d]["by_type"][t]["income_gold"] + gold, 4
+                )
+            else:  # csvExpense
+                daily[d]["expense_gold"] = round(daily[d]["expense_gold"] + gold, 4)
+                daily[d]["by_type"][t]["expense_gold"] = round(
+                    daily[d]["by_type"][t]["expense_gold"] + gold, 4
+                )
+            daily[d]["by_type"][t]["count"] += 1
+
+    # net_gold 계산
+    for d, data in daily.items():
+        data["net_gold"] = round(data["income_gold"] - data["expense_gold"], 4)
+
+    return dict(sorted(daily.items()))
+
+
+def save_transactions(daily: dict, output_dir: str) -> list[str]:
+    """
+    일별 수입/지출 정보를 output_dir/transactions/YYYY/MM/DD.json 파일로 저장합니다.
+    저장된 파일 경로 리스트를 반환합니다.
+    """
+    saved = []
+    for date_str, data in daily.items():
+        yyyy, mm, dd = date_str.split("-")
+        day_dir = os.path.join(output_dir, "transactions", yyyy, mm)
+        os.makedirs(day_dir, exist_ok=True)
+        path = os.path.join(day_dir, f"{dd}.json")
+        payload = {"date": date_str, **data}
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        saved.append(path)
+    return saved
+
+
 def save_crafting_by_date(records: list[dict], output_dir: str) -> list[str]:
     """
-    주문제작 날짜별로 output_dir/crafting/YYYY/MM/DD_crafting.json 저장.
+    주문제작 날짜별로 output_dir/crafting/YYYY/MM/DD.json 저장.
+    날짜는 주문제작이 기록된 일자 기준이며, 수수료는 골드 단위로 소수점 4자리까지 기록합니다.
     저장된 파일 경로 리스트를 반환합니다.
     """
     by_date: dict[str, list[dict]] = {}
@@ -399,13 +515,21 @@ def save_crafting_by_date(records: list[dict], output_dir: str) -> list[str]:
         day_dir = os.path.join(output_dir, "crafting", yyyy, mm)
         os.makedirs(day_dir, exist_ok=True)
         path = os.path.join(day_dir, f"{dd}.json")
-        total_copper = sum(r["amount_copper"] for r in recs)
+        total_gold = round(sum(r["amount_gold"] for r in recs), 4)
         payload = {
             "date": recs[0]["date"],
             "total_orders": len(recs),
-            "total_copper": total_copper,
-            "total_gold": round(copper_to_gold(total_copper), 4),
-            "orders": recs,
+            "total_gold": total_gold,
+            "orders": [
+                {
+                    "datetime": r["datetime"],
+                    "requester": r["requester"],
+                    "crafter": r["crafter"],
+                    "crafter_server": r.get("crafter_server", ""),
+                    "amount_gold": r["amount_gold"],
+                }
+                for r in recs
+            ],
         }
         with open(path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
@@ -432,8 +556,9 @@ def _safe_name(name: str) -> str:
 def save_crafting_by_requester(records: list[dict], output_dir: str) -> list[str]:
     """
     주문제작 요청자별로 output_dir/crafting/서버명/캐릭명.json 저장.
-    - 요청자 서버 정보가 없으면 첫 번째 제작자 서버를 사용
-    - 각 주문에 천로제작 아이템(수수료), 제작자 캐릭명, 서버명 포함
+    - 요청자 서버 정보가 없으면 제작자 서버와 동일하게 처리한다.
+    - 제작 아이템(수수료), 제작자 캐릭명, 제작자 서버명을 기록한다.
+    - 수수료는 골드 단위로 소수점 4자리까지 기록한다.
     """
     crafting_dir = os.path.join(output_dir, "crafting")
 
@@ -444,7 +569,7 @@ def save_crafting_by_requester(records: list[dict], output_dir: str) -> list[str
     saved = []
     for requester, recs in sorted(by_requester.items()):
         server, char = _parse_requester(requester)
-        # 요청자 서버 미확인 시 첫 번째 제작자 서버를 폴백으로 사용
+        # 요청자 서버 정보가 없으면 제작자 서버와 동일하게 처리
         if server == "_unknown":
             server = recs[0].get("crafter_server", "_unknown")
 
@@ -452,21 +577,19 @@ def save_crafting_by_requester(records: list[dict], output_dir: str) -> list[str
         os.makedirs(server_dir, exist_ok=True)
         path = os.path.join(server_dir, f"{_safe_name(char)}.json")
 
-        total_copper = sum(r["amount_copper"] for r in recs)
+        total_gold = round(sum(r["amount_gold"] for r in recs), 4)
         payload = {
             "requester": requester,
             "server": server,
             "character": char,
             "total_orders": len(recs),
-            "total_copper": total_copper,
-            "total_gold": round(copper_to_gold(total_copper), 4),
+            "total_gold": total_gold,
             "orders": [
                 {
                     "date": r["date"],
                     "datetime": r["datetime"],
                     "crafter": r["crafter"],
                     "crafter_server": r.get("crafter_server", ""),
-                    "amount_copper": r["amount_copper"],
                     "amount_gold": r["amount_gold"],
                 }
                 for r in recs
@@ -479,12 +602,12 @@ def save_crafting_by_requester(records: list[dict], output_dir: str) -> list[str
 
 
 def print_crafting_summary(records: list[dict], n: int = 10) -> None:
-    """예시: 최근 n건 주문제작 건수/총수익 요약 출력."""
+    """최근 n건 주문제작 건수/총수익 요약 출력."""
     if not records:
         print("\n[주문제작 이력] 데이터 없음")
         return
 
-    total_gold = sum(r["amount_copper"] for r in records) / 10000
+    total_gold = sum(r["amount_gold"] for r in records)
     print(f"\n[주문제작 이력 요약] 총 {len(records)}건 / {total_gold:,.0f} G")
 
     # 요청자별 통계
@@ -492,19 +615,123 @@ def print_crafting_summary(records: list[dict], n: int = 10) -> None:
     for rec in records:
         req = rec["requester"]
         if req not in by_req:
-            by_req[req] = {"count": 0, "copper": 0}
+            by_req[req] = {"count": 0, "gold": 0.0}
         by_req[req]["count"] += 1
-        by_req[req]["copper"] += rec["amount_copper"]
+        by_req[req]["gold"] += rec["amount_gold"]
 
     print(f"\n[요청자 TOP {n}]")
-    print(f"  {'\uc694\uccad\uc790':<30} {'\uac74\uc218':>6} {'\uc218\uc775':>16}")
+    print(f"  {'요청자':<30} {'건수':>6} {'수익':>16}")
     print("  " + "-" * 56)
-    top = sorted(by_req.items(), key=lambda x: -x[1]["copper"])[:n]
+    top = sorted(by_req.items(), key=lambda x: -x[1]["gold"])[:n]
     for req, stat in top:
         print(
             f"  {req:<30} {stat['count']:>6}건"
-            f" {copper_to_gold(stat['copper']):>14,.0f} G"
+            f" {stat['gold']:>14,.0f} G"
         )
+
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 차트 생성
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def generate_chart(
+    gold_history: dict,
+    daily_transactions: dict,
+    output_dir: str,
+) -> str:
+    """
+    일별 골드 보유량(total_gold) + 수입/지출(income_gold, expense_gold) 정보로
+    누적형 영역 차트(stacked area chart)를 생성하여 output_dir/transactions.png 에 저장합니다.
+
+    X축: 일자 (YYYY-MM-DD), Y축: 골드량 (정수)
+    """
+    # 한글 폰트 설정
+    try:
+        font_path = os.path.join(os.path.dirname(__file__), "fonts", "NanumGothic.ttf")
+        if os.path.exists(font_path):
+            fe = fm.FontEntry(fname=font_path, name='NanumGothic')
+            fm.fontManager.ttflist.insert(0, fe)
+            plt.rc('font', family='NanumGothic')
+        plt.rcParams['axes.unicode_minus'] = False
+    except Exception as e:
+        print(f"[차트] 폰트 설정 중 오류 발생 (영문으로 진행): {e}")
+
+    all_dates = sorted(set(gold_history.keys()) | set(daily_transactions.keys()))
+    if not all_dates:
+        print("[차트] 데이터가 없어 차트를 생성하지 않습니다.")
+        return ""
+
+    dates = [datetime.strptime(d, "%Y-%m-%d") for d in all_dates]
+    total_gold = [gold_history.get(d, {}).get("total_gold", 0) for d in all_dates]
+
+    # 모든 거래 유형 수집
+    income_types = sorted({t for d in all_dates for t in daily_transactions.get(d, {}).get("by_type", {})
+                           if daily_transactions[d]["by_type"][t].get("income_gold", 0) > 0})
+    expense_types = sorted({t for d in all_dates for t in daily_transactions.get(d, {}).get("by_type", {})
+                            if daily_transactions[d]["by_type"][t].get("expense_gold", 0) > 0})
+
+    # 유형별 시계열 데이터 준비
+    income_data = {t: [daily_transactions.get(d, {}).get("by_type", {}).get(t, {}).get("income_gold", 0.0)
+                       for d in all_dates] for t in income_types}
+    expense_data = {t: [daily_transactions.get(d, {}).get("by_type", {}).get(t, {}).get("expense_gold", 0.0)
+                        for d in all_dates] for t in expense_types}
+
+    fig, axes = plt.subplots(3, 1, figsize=(14, 12), sharex=True,
+                             gridspec_kw={"height_ratios": [3, 2, 2]})
+    fig.patch.set_facecolor("#1a1a2e")
+
+    ax_gold, ax_income, ax_expense = axes
+
+    # ── 상단 (ax_gold): 총 골드 보유량 ──
+    ax_gold.set_facecolor("#16213e")
+    ax_gold.fill_between(dates, total_gold, alpha=0.35, color="#ffd700", linewidth=0)
+    ax_gold.plot(dates, total_gold, color="#ffd700", linewidth=1.8, label="총 골드")
+    ax_gold.set_ylabel("보유 골드 (G)", color="#e0e0e0", fontsize=10)
+    ax_gold.tick_params(colors="#e0e0e0")
+    ax_gold.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:,.0f}G"))
+    ax_gold.spines[:].set_color("#444")
+    ax_gold.legend(loc="upper left", facecolor="#16213e", edgecolor="#444", labelcolor="#e0e0e0", fontsize=9)
+    ax_gold.set_title("WOW 일별 골드 보유량 / 유형별 수입 및 지출 (분리형)", color="#e0e0e0", fontsize=13, pad=10)
+
+    # ── 중단 (ax_income): 유형별 수입 누적 차트 ──
+    ax_income.set_facecolor("#16213e")
+    if income_types:
+        stacks = [income_data[t] for t in income_types]
+        ax_income.stackplot(dates, *stacks, labels=income_types, alpha=0.75)
+    ax_income.set_ylabel("수입 (G)", color="#e0e0e0", fontsize=10)
+    ax_income.tick_params(colors="#e0e0e0")
+    ax_income.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:,.0f}G"))
+    ax_income.spines[:].set_color("#444")
+    ax_income.legend(loc="upper left", bbox_to_anchor=(1.01, 1),
+                      facecolor="#16213e", edgecolor="#444", labelcolor="#e0e0e0", fontsize=8, title="수입 유형")
+
+    # ── 하단 (ax_expense): 유형별 지출 누적 차트 ──
+    ax_expense.set_facecolor("#16213e")
+    if expense_types:
+        stacks = [expense_data[t] for t in expense_types]
+        ax_expense.stackplot(dates, *stacks, labels=expense_types, alpha=0.75, colors=plt.cm.Reds(np.linspace(0.4, 0.8, len(expense_types))))
+    ax_expense.set_ylabel("지출 (G)", color="#e0e0e0", fontsize=10)
+    ax_expense.tick_params(colors="#e0e0e0")
+    ax_expense.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:,.0f}G"))
+    ax_expense.spines[:].set_color("#444")
+    ax_expense.legend(loc="upper left", bbox_to_anchor=(1.01, 1),
+                       facecolor="#16213e", edgecolor="#444", labelcolor="#e0e0e0", fontsize=8, title="지출 유형")
+
+    # X축 날짜 포맷
+    ax_expense.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
+    ax_expense.xaxis.set_major_locator(mdates.AutoDateLocator(minticks=5, maxticks=10))
+    plt.setp(ax_expense.xaxis.get_majorticklabels(), rotation=30, ha="right", color="#e0e0e0")
+
+    plt.tight_layout()
+    plt.subplots_adjust(right=0.85, hspace=0.3)
+
+    out_path = os.path.join(output_dir, "transactions.png")
+    os.makedirs(output_dir, exist_ok=True)
+    plt.savefig(out_path, dpi=150, bbox_inches="tight", facecolor=fig.get_facecolor())
+    plt.close(fig)
+    return out_path
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -512,10 +739,10 @@ def print_crafting_summary(records: list[dict], n: int = 10) -> None:
 # ──────────────────────────────────────────────────────────────────────────────
 
 def print_summary(assets: dict, diff: dict | None = None) -> None:
-    """콘솔에 자산 요약을 출력합니다."""
+    """콘솔에 자산 요약을 출력합니다. (골드 단위, 실버/코퍼 미표시)"""
     print("\n=== WOW Asset Tracker ===")
     print(f"추출 시각: {assets['extracted_at']}")
-    print(f"\n[총 자산] {assets['total_gold']:,.4f} G  ({assets['total_copper']:,} copper)")
+    print(f"\n[총 자산] {assets['total_gold']:,.4f} G")
 
     if diff:
         sign = "+" if diff["total_diff_gold"] >= 0 else ""
@@ -524,7 +751,7 @@ def print_summary(assets: dict, diff: dict | None = None) -> None:
     print("\n[캐릭터별 골드]")
     for char, data in sorted(
         assets["characters"].items(),
-        key=lambda x: x[1]["money_copper"],
+        key=lambda x: x[1]["money_gold"],
         reverse=True,
     ):
         print(f"  {char:<50} {data['money_gold']:>14,.4f} G", end="")
@@ -587,6 +814,18 @@ def main() -> None:
     req_files = save_crafting_by_requester(crafting_records, args.output_path)
     print(f"날짜별 저장 완료: {len(date_files)}개 파일")
     print(f"요청자별 저장 완료: {len(req_files)}개 파일 (output/crafting/)")
+
+    # 수입/지출 이력 추출 및 저장
+    print("수입/지출 이력 추출 중...")
+    daily_tx = extract_transactions(raw)
+    tx_files = save_transactions(daily_tx, args.output_path)
+    print(f"수입/지출 저장 완료: {len(tx_files)}개 파일 (output/transactions/)")
+
+    # 차트 생성
+    print("차트 생성 중...")
+    chart_path = generate_chart(history, daily_tx, args.output_path)
+    if chart_path:
+        print(f"차트 저장 완료: {chart_path}")
 
     # 요약 출력
     print_gold_history(history)

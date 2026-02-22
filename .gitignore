@@ -1,3 +1,5 @@
 output/
 .env
 .agent/workflows/
+__pycache__/
+fonts/
