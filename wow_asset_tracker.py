@@ -1,6 +1,6 @@
 """
 WOW Asset Tracker
-TradeSkillMaster Addon 설정 파일에서 WOW 자산 정보를 추출하여 일별 JSON 파일로 저장합니다.
+TradeSkillMaster / CraftSim Addon 설정 파일에서 WOW 자산 정보를 추출하여 일별 JSON 파일로 저장합니다.
 
 목표:
   1. 일별 총 골드 정보를 캐릭터별/warbank별로 구분하여 저장한다.
@@ -8,11 +8,10 @@ TradeSkillMaster Addon 설정 파일에서 WOW 자산 정보를 추출하여 일
      - 접속 기록이 없는 날은 직전 보유량을 이월(forward-fill)한다.
      - 저장 경로: $OUTPUT_PATH/gold/YYYY/MM/DD.json
      - 캐릭터 목록은 "캐릭명-서버명" 형태로 기록한다.
-  2. 전문기술 주문제작 내역을 추출하여 저장한다.
+  2. CraftSim Addon 파일에서 주문제작 이력을 추출하여 저장한다.
      - 날짜별: $OUTPUT_PATH/crafting/YYYY/MM/DD.json (주문제작 기록 일자 기준)
      - 요청자별: $OUTPUT_PATH/crafting/서버명/캐릭명.json
      - 수수료는 골드 단위로 소수점 4자리까지 기록한다.
-     - 요청자 서버 정보가 없으면 제작자 서버와 동일하게 처리한다.
   3. 유형별 수입/지출 내역을 저장한다.
      - 저장 경로: $OUTPUT_PATH/transactions/YYYY/MM/DD.json
   4. 일별 골드 보유량 + 수입/지출 정보를 통해 누적형 영역 차트를 생성한다.
@@ -20,12 +19,13 @@ TradeSkillMaster Addon 설정 파일에서 WOW 자산 정보를 추출하여 일
      - 저장 경로: $OUTPUT_PATH/transactions.png
 
 입력:
-  --lua-path    또는 .env 의 LUA_PATH    : TradeSkillMaster.lua 파일 경로
-  --output-path 또는 .env 의 OUTPUT_PATH : 출력 디렉토리 경로 (기본값: ./output)
+  --lua-path      또는 .env 의 LUA_PATH      : TradeSkillMaster.lua 파일 경로
+  --craftsim-path 또는 .env 의 CRAFTSIM_PATH : CraftSim.lua 파일 경로
+  --output-path   또는 .env 의 OUTPUT_PATH   : 출력 디렉토리 경로 (기본값: ./output)
 
 실행 방법:
   python wow_asset_tracker.py
-  python wow_asset_tracker.py --lua-path "/path/to/TradeSkillMaster.lua" --output-path "./output"
+  python wow_asset_tracker.py --lua-path "/path/to/TradeSkillMaster.lua" --craftsim-path "/path/to/CraftSim.lua" --output-path "./output"
 """
 
 import re
@@ -331,7 +331,7 @@ def print_gold_history(history: dict, n: int = 10) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 주문제작 이력 추출 (csvIncome)
+# 주문제작 이력 추출 (CraftSim Addon)
 # ──────────────────────────────────────────────────────────────────────────────
 
 
@@ -371,34 +371,137 @@ def parse_csv_records(csv_str: str) -> list[dict]:
     return records
 
 
-def extract_crafting_orders(raw: dict) -> list[dict]:
+def _extract_item_name(item_link: str) -> str:
     """
-    모든 csvIncome 키에서 Crafting Order 레코드를 수집하여 날짜 순으로 정렬합니다.
-    키 패턴: r@<서버>@internalData@csvIncome → 서버명을 crafter_server로 기록
+    WoW 아이템 링크에서 아이템 이름을 추출합니다.
+    형식: ....|h[아이템명 |A:...|a]|h|r  또는  ...|h[아이템명]|h|r
     """
-    pattern = re.compile(r"^r@(.+?)@internalData@csvIncome$")
-    seen = set()
+    m = re.search(r'\|h\[(.+?)(?:\s*\|A:[^\|]*\|a)?\]', item_link)
+    return m.group(1).strip() if m else ""
+
+
+def _extract_item_id(item_link: str) -> int | None:
+    """WoW 아이템 링크에서 itemID를 추출합니다."""
+    m = re.search(r'\|Hitem:(\d+)', item_link)
+    return int(m.group(1)) if m else None
+
+
+def parse_craftsim_file(path: str) -> list[dict]:
+    """
+    CraftSim.lua 파일을 파싱하여 주문제작 이력 레코드 리스트를 반환합니다.
+
+    CraftSim.lua 구조:
+      CraftSimDB = {
+        ["customerHistoryDB"] = {
+          ["data"] = {
+            ["고객명-서버명"] = {
+              ["customer"] = "고객명",
+              ["realm"] = "서버명",   -- 고객 서버
+              ["craftHistory"] = {
+                {
+                  ["tip"] = 5000000,          -- copper 단위
+                  ["itemLink"] = "...",
+                  ["timestamp"] = 1757019480,
+                },
+                ...
+              },
+            },
+            ...
+          }
+        }
+      }
+
+    반환 레코드 구조:
+    {
+        "date": "YYYY-MM-DD",
+        "date_compact": "YYYYMMDD",
+        "datetime": "ISO-8601",
+        "requester": "고객명-서버명",
+        "requester_char": "고객명",
+        "requester_server": "서버명",
+        "item_name": "아이템 이름",
+        "item_id": int | None,
+        "amount_gold": float,  # 소수점 4자리 골드
+    }
+    """
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"CraftSim 파일을 찾을 수 없습니다: {path}")
+
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+
     records = []
 
-    for key, value in raw.items():
-        m = pattern.match(key)
-        if not m:
+    # customerHistoryDB.data 섹션에서 고객 항목을 순차 파싱
+    # 고객 키 패턴: ["고객명-서버명"] = { ... ["customer"] ... ["realm"] ... ["craftHistory"] ...  }
+    # 각 항목의 경계는 다음 고객 키 또는 파일 끝으로 판단
+    customer_pattern = re.compile(
+        r'^\["([^"]+)"\] = \{\s*\n\s*\["chatHistory"\]',
+        re.MULTILINE
+    )
+
+    tip_pattern = re.compile(r'\["tip"\] = (\d+),')
+    item_link_pattern = re.compile(r'\["itemLink"\] = "([^"]+)",')
+    timestamp_pattern = re.compile(r'\["timestamp"\] = (\d+),')
+    realm_pattern = re.compile(r'\["realm"\] = "([^"]+)",')
+    customer_name_pattern = re.compile(r'\["customer"\] = "([^"]+)",')
+
+    # 모든 고객 항목 위치 찾기
+    matches = list(customer_pattern.finditer(content))
+
+    for i, match in enumerate(matches):
+        key_str = match.group(1)  # "고객명-서버명"
+        start = match.start()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(content)
+        block = content[start:end]
+
+        # customer 이름과 realm 추출
+        cname_m = customer_name_pattern.search(block)
+        realm_m = realm_pattern.search(block)
+        requester_char = cname_m.group(1) if cname_m else key_str.rsplit("-", 1)[0]
+        requester_server = realm_m.group(1) if realm_m else "_unknown"
+        requester = key_str  # 원본 키 ("고객명-서버명")
+
+        # craftHistory 섹션 추출
+        craft_start = block.find('["craftHistory"]')
+        if craft_start == -1:
             continue
-        if not isinstance(value, str):
-            continue
-        crafter_server = m.group(1).strip()
-        for rec in parse_csv_records(value):
-            if rec["type"] != "Crafting Order":
+        craft_block = block[craft_start:]
+
+        # craftHistory 내 개별 제작 항목 파싱
+        # 각 항목은 { ... } 블록, tip/itemLink/timestamp 를 함께 추출
+        # 항목 경계: 연속된 { }로 구분 → timestamp 기준으로 분할
+        ts_positions = [m.start() for m in timestamp_pattern.finditer(craft_block)]
+
+        for j, ts_pos in enumerate(ts_positions):
+            # 이 timestamp를 포함하는 블록의 시작 (직전 '{' 탐색)
+            seg_start = craft_block.rfind("{", 0, ts_pos)
+            seg_end = ts_positions[j + 1] if j + 1 < len(ts_positions) else len(craft_block)
+            seg = craft_block[seg_start:seg_end]
+
+            tip_m = tip_pattern.search(seg)
+            link_m = item_link_pattern.search(seg)
+            ts_m = timestamp_pattern.search(seg)
+
+            if not ts_m:
                 continue
-            uid = (rec["other_player"], rec["player"], rec["datetime"])
-            if uid in seen:
-                continue
-            seen.add(uid)
-            rec["crafter_server"] = crafter_server
-            # crafting 함수와의 호환을 위해 requester/crafter 필드 추가
-            rec["requester"] = rec["other_player"]
-            rec["crafter"] = rec["player"]
-            records.append(rec)
+
+            ts = int(ts_m.group(1))
+            tip_copper = int(tip_m.group(1)) if tip_m else 0
+            item_link = link_m.group(1) if link_m else ""
+
+            dt = datetime.fromtimestamp(ts, tz=timezone.utc)
+            records.append({
+                "date": dt.strftime("%Y-%m-%d"),
+                "date_compact": dt.strftime("%Y%m%d"),
+                "datetime": dt.isoformat(),
+                "requester": requester,
+                "requester_char": requester_char,
+                "requester_server": requester_server,
+                "item_name": _extract_item_name(item_link),
+                "item_id": _extract_item_id(item_link),
+                "amount_gold": round(copper_to_gold(tip_copper), 4),
+            })
 
     records.sort(key=lambda r: r["datetime"])
     return records
@@ -524,8 +627,8 @@ def save_crafting_by_date(records: list[dict], output_dir: str) -> list[str]:
                 {
                     "datetime": r["datetime"],
                     "requester": r["requester"],
-                    "crafter": r["crafter"],
-                    "crafter_server": r.get("crafter_server", ""),
+                    "item_name": r.get("item_name", ""),
+                    "item_id": r.get("item_id"),
                     "amount_gold": r["amount_gold"],
                 }
                 for r in recs
@@ -553,11 +656,66 @@ def _safe_name(name: str) -> str:
     return re.sub(r'[\\/:*?"<>|]', "_", name)
 
 
+def load_crafting_records_from_files(output_dir: str) -> list[dict]:
+    """
+    output_dir/crafting/YYYY/MM/DD.json 파일들을 전부 읽어
+    주문제작 레코드 리스트를 재구성합니다.
+
+    입력파일(CraftSim.lua)에서 과거 데이터가 삭제되더라도
+    날짜별 JSON 파일이 누적 원본이므로 이를 기준으로 집계합니다.
+    """
+    crafting_dir = os.path.join(output_dir, "crafting")
+    records = []
+    # crafting/YYYY/MM/DD.json 패턴만 읽음 (서버명/ 하위 파일 제외)
+    for root, dirs, files in os.walk(crafting_dir):
+        # 서버명 디렉토리(알파벳/한글 이름) 하위는 건너뜀
+        # YYYY 패턴(4자리 숫자)인 디렉토리만 진입
+        rel = os.path.relpath(root, crafting_dir)
+        parts = rel.split(os.sep)
+        # depth 0 (crafting_dir 자체)는 통과
+        if rel != ".":
+            # 첫 번째 하위는 YYYY 숫자여야 함
+            if not parts[0].isdigit() or len(parts[0]) != 4:
+                dirs.clear()  # 이 디렉토리 이하 탐색 중단
+                continue
+        for fname in files:
+            if not fname.endswith(".json"):
+                continue
+            fpath = os.path.join(root, fname)
+            try:
+                with open(fpath, encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                continue
+            date_str = data.get("date", "")
+            for order in data.get("orders", []):
+                requester = order.get("requester", "")
+                if not requester:
+                    continue
+                # requester 키에서 캐릭명/서버명 분리
+                if "-" in requester:
+                    req_char, req_server = requester.rsplit("-", 1)
+                else:
+                    req_char, req_server = requester, "_unknown"
+                records.append({
+                    "date": date_str,
+                    "datetime": order.get("datetime", ""),
+                    "requester": requester,
+                    "requester_char": req_char.strip(),
+                    "requester_server": req_server.strip(),
+                    "item_name": order.get("item_name", ""),
+                    "item_id": order.get("item_id"),
+                    "amount_gold": order.get("amount_gold", 0.0),
+                })
+    records.sort(key=lambda r: r["datetime"])
+    return records
+
+
 def save_crafting_by_requester(records: list[dict], output_dir: str) -> list[str]:
     """
     주문제작 요청자별로 output_dir/crafting/서버명/캐릭명.json 저장.
-    - 요청자 서버 정보가 없으면 제작자 서버와 동일하게 처리한다.
-    - 제작 아이템(수수료), 제작자 캐릭명, 제작자 서버명을 기록한다.
+    - records는 load_crafting_records_from_files()로 읽은 전체 누적 이력을 사용.
+    - 제작 아이템명, item_id, 수수료를 기록한다.
     - 수수료는 골드 단위로 소수점 4자리까지 기록한다.
     """
     crafting_dir = os.path.join(output_dir, "crafting")
@@ -568,10 +726,8 @@ def save_crafting_by_requester(records: list[dict], output_dir: str) -> list[str
 
     saved = []
     for requester, recs in sorted(by_requester.items()):
-        server, char = _parse_requester(requester)
-        # 요청자 서버 정보가 없으면 제작자 서버와 동일하게 처리
-        if server == "_unknown":
-            server = recs[0].get("crafter_server", "_unknown")
+        server = recs[0].get("requester_server", "_unknown")
+        char = recs[0].get("requester_char", requester)
 
         server_dir = os.path.join(crafting_dir, _safe_name(server))
         os.makedirs(server_dir, exist_ok=True)
@@ -588,8 +744,8 @@ def save_crafting_by_requester(records: list[dict], output_dir: str) -> list[str
                 {
                     "date": r["date"],
                     "datetime": r["datetime"],
-                    "crafter": r["crafter"],
-                    "crafter_server": r.get("crafter_server", ""),
+                    "item_name": r.get("item_name", ""),
+                    "item_id": r.get("item_id"),
                     "amount_gold": r["amount_gold"],
                 }
                 for r in recs
@@ -777,12 +933,17 @@ def print_summary(assets: dict, diff: dict | None = None) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="WOW TradeSkillMaster 자산 추출기",
+        description="WOW TradeSkillMaster / CraftSim 자산 추출기",
     )
     parser.add_argument(
         "--lua-path",
         default=os.getenv("LUA_PATH"),
         help="TradeSkillMaster.lua 파일 경로 (.env의 LUA_PATH 또는 이 인수로 지정)",
+    )
+    parser.add_argument(
+        "--craftsim-path",
+        default=os.getenv("CRAFTSIM_PATH"),
+        help="CraftSim.lua 파일 경로 (.env의 CRAFTSIM_PATH 또는 이 인수로 지정)",
     )
     parser.add_argument(
         "--output-path",
@@ -807,12 +968,20 @@ def main() -> None:
     gold_files = save_gold_history(history, args.output_path)
     print(f"골드 이력 저장 완료: {len(gold_files)}개 파일 (output/gold/)")
 
-    # 주문제작 이력 추출 및 저장
-    print("주문제작 이력 추출 중...")
-    crafting_records = extract_crafting_orders(raw)
-    date_files = save_crafting_by_date(crafting_records, args.output_path)
-    req_files = save_crafting_by_requester(crafting_records, args.output_path)
-    print(f"날짜별 저장 완료: {len(date_files)}개 파일")
+    # 주문제작 이력 추출 및 저장 (CraftSim)
+    crafting_records: list[dict] = []
+    if args.craftsim_path:
+        print(f"CraftSim 파일 읽는 중: {args.craftsim_path}")
+        crafting_records = parse_craftsim_file(args.craftsim_path)
+        date_files = save_crafting_by_date(crafting_records, args.output_path)
+        print(f"날짜별 저장 완료: {len(date_files)}개 파일 (output/crafting/)")
+    else:
+        print("CRAFTSIM_PATH 미설정 → 주문제작 이력 처리 건너뜀")
+
+    # 요청자별 파일 생성: 누적된 날짜별 JSON 파일을 원본으로 사용 (6.4)
+    print("요청자별 이력 집계 중 (crafting/YYYY/MM/DD.json 기준)...")
+    all_crafting_records = load_crafting_records_from_files(args.output_path)
+    req_files = save_crafting_by_requester(all_crafting_records, args.output_path)
     print(f"요청자별 저장 완료: {len(req_files)}개 파일 (output/crafting/)")
 
     # 수입/지출 이력 추출 및 저장
